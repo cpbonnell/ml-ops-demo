@@ -1,0 +1,87 @@
+[tool.poetry]
+name = "version-flow"
+version = "v0.30.0-rc.1"
+description = "A package for bumping version based on commit messages."
+authors = ["Christian Bonnell <cbonnell@clairity.com>"]
+readme = "README.md"
+
+[tool.version-flow]
+version_specification = "semver"
+files_to_update = ["version_flow/__init__.py"]
+trunk_branch = "main"
+release_branch = "release"
+
+[tool.poetry.dependencies]
+python = "^3.14"
+semver = "^3.0.4"
+dulwich = "^1.1.0"
+tomlkit = "^0.14.0"
+pygithub = "2.8.1"
+giturlparse = "^0.14.0"
+responses = "^0.25.8"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+black = "^26.3.1"
+isort = "^7.0.0"
+flake8 = "^7.3.0"
+mypy = "^1.19.1"
+pytest-cov = "^7.0.0"
+pytest-sugar = "^1.1.1"
+pytest-split = "^0.11.0"
+pytest-doctestplus = "^1.7.1"
+pytest-metadata = "^3.1.1"
+pytest-xdist = "^3.8.0"
+pytest-html = "^4.2.0"
+lorem = "^0.1.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.1", "packaging>=24.2"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+target-version = ["py312"]
+include = '\.pyi?$'
+line-length = 120
+
+[tool.pytest.ini_options]
+addopts = "-s -vvv --disable-warnings --store-durations --cov=version_flow --html=test-results/report.html --cov-report term-missing --cov-report annotate --cov-report=xml --no-cov-on-fail --max-worker-restart=1 --junitxml=test-results/junit.xml"
+testpaths = ["tests"]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(message)s"
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["version_flow", "tests"]
+omit = ["*__init__*", "*__pycache__*", ".pytest_cache/*", "*.egg-info/*", ".vscode/*", ".test_durations", "docs/*", "build/*", "dist/*", "scripts/*", "tests/*", "*.json", "*.circleci/*", "*.github/*", "*.test_durations", "*.gitignore", "*.gitattributes", "setup.py", "setup.cfg", "requirements.txt", "requirements-dev.txt", "README.rst", "README.md", "Makefile", "Dockerfile", "docker-compose.yml", "test-results/**", "poetry.lock", "pyproject.toml", ".gitignore", ".dockerignore", "*test_*"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "def __str__",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "if typing.TYPE_CHECKING:"
+]
+
+[tool.coverage.html]
+directory = "test-results/coverage/html"
+
+[tool.mypy]
+disallow_any_unimported = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+check_untyped_defs = true
+show_error_codes = true
+
+[tool.poetry.scripts]
+version-flow = "version_flow.cli:main"

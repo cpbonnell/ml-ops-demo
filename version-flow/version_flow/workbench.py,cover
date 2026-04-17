@@ -1,0 +1,32 @@
+! import re
+! from pathlib import Path
+! import time
+  
+! from babel.dates import parse_time
+! from dulwich.repo import Repo
+! from dulwich import porcelain
+! from enum import Enum
+! from secrets import token_hex
+! from tempfile import TemporaryDirectory
+! from dulwich.objects import Tree, Commit, parse_timezone
+  
+! from version_flow.types import CommitType
+! from typing import Optional
+  
+! most_recent_version_tag = "v1.2.3-rc.4"
+  
+! td = TemporaryDirectory()
+! repo_root_dir = Path(td.name)
+  
+! repo = Repo.init(repo_root_dir.as_posix(), default_branch=b"main")
+! config = repo.get_config()
+! config.set("user", "name", "Test Testerson")
+! config.set("user", "email", "test.testerson@clairity.com")
+  
+  
+! def random_file_factory() -> str:
+!     new_file_name = f"{token_hex(4)}.txt"
+!     with open(repo_root_dir / new_file_name, "w") as f:
+!         f.write(token_hex(16))
+  
+!     return new_file_name

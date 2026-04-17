@@ -1,0 +1,5 @@
+! from version_flow.types import BumpPriority
+  
+  
+! def get_bump_from_messages(messages: list[str]) -> BumpPriority:
+-     raise NotImplementedError()

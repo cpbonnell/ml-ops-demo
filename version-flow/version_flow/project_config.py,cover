@@ -1,0 +1,224 @@
+> import logging
+> import os
+> from functools import cached_property
+> from pathlib import Path
+  
+> import giturlparse
+> import tomlkit
+> from dulwich.repo import Repo
+> from github import Auth, Github
+> from github import Repository as GHRepo
+  
+> from version_flow.project_version import ProjectVersion
+> from version_flow.types import VersionSpec, GitBranchStrategy
+> from version_flow.version import Version
+  
+> logger = logging.getLogger(__name__)
+  
+  
+> class ProjectConfig:
+>     """A class representing the config of a Python project that version-flow will operate on."""
+  
+>     def __init__(self, config_location: Path | str):
+>         if isinstance(config_location, str):
+>             config_location = Path(config_location)
+  
+>         if config_location.is_dir():
+              # look for a pyproject.toml in this directory
+>             self._config_file_path = config_location / "pyproject.toml"
+>             if not self._config_file_path.is_file():
+>                 logger.warning(
+>                     f"Could not find a pyproject.toml file in the directory {config_location.as_posix()}. "
+>                     f"Please ensure that a pyproject.toml file exists in this directory, or specify a different "
+>                     f"directory or TOML file. Continuing default values."
+>                 )
+                  # TODO: we need a more careful treatment of missing config files, but that is outside the current scope.
+                  # The more careful treatment should consider all properties of the config class, and whether they should
+                  # return defaults, or raise an error if accessed in a context where there is no file to read them from.
+>         elif config_location.is_file():
+              # ensure this file can be parsed as TOML, and store it
+>             self._config_file_path = config_location
+>             self._load_config()
+!         else:
+!             raise ValueError(f"Cannot do anything with this config file: {config_location.as_posix()}")
+  
+>         self._project_root = config_location.expanduser().resolve()
+  
+>     @property
+>     def project_root(self) -> Path:
+>         """This is the directory containing the config file used by version-flow."""
+>         return self._config_file_path.parent
+  
+>     @property
+>     def repository_root(self) -> Path:
+>         """This is the root of the repository containing the config file used by version-flow."""
+          # Start at the project root and move upward until we find the repo root
+>         current_dir = self._project_root
+>         while not (current_dir / ".git").is_dir():
+>             if current_dir == current_dir.parent:
+!                 raise ValueError(
+!                     f"Could not find a repository root with a .git directory. Please ensure that the config file "
+!                     f"{self._config_file_path} is inside a valid Git repository."
+!                 )
+>             current_dir = current_dir.parent
+>         return current_dir
+  
+>     @property
+>     def project_config_path(self) -> Path:
+>         return self._config_file_path
+  
+>     def _load_config(self) -> tomlkit.TOMLDocument:
+>         with open(self.project_config_path, "r") as f:
+>             return tomlkit.load(f)
+  
+>     def _load_tool_config(self) -> tomlkit.TOMLDocument:
+>         return self._load_config()["tool"]["version-flow"]
+  
+>     def _load_managed_branches(self) -> dict[str, any]:
+>         return self._load_tool_config().get("managed-branches", {})
+  
+>     @property
+>     def version_string(self) -> str:
+>         match self._load_config():
+>             case {"project": {"version": v}}:  # Matches Poetry 2.x and UV
+>                 return v
+>             case {"tool": {"poetry": {"version": v}}}:  # Matches Poetry 1.x
+>                 return v
+!             case _:
+!                 raise ValueError(f"Could not identify a version setting in {self._config_file_path.as_posix()}.")
+  
+>     @property
+>     def version_spec(self) -> VersionSpec:
+>         doc = self._load_tool_config()
+>         return VersionSpec.from_string(doc["version_specification"])
+  
+>     @property
+>     def trunk_branch(self) -> str:
+>         """The name of the branch to use as "trunk"."""
+>         from_managed_branches = self._load_managed_branches().get("trunk")
+>         if from_managed_branches:
+!             return from_managed_branches
+  
+>         from_base_config = self._load_tool_config().get("trunk_branch")
+>         if from_base_config:
+>             return from_base_config
+  
+!         return "main"
+  
+>     @property
+>     def staging_branch(self) -> str:
+>         """The name of the branch to use as "staging"."""
+>         from_file = self._load_tool_config().get("staging_branch")
+>         return from_file if from_file else "staging"
+  
+>     @property
+>     def release_branch(self) -> str:
+>         """The name of the branch to use as "release"."""
+>         from_managed_branches = self._load_managed_branches().get("release")
+>         if from_managed_branches:
+!             return from_managed_branches
+  
+>         from_base_config = self._load_tool_config().get("release_branch")
+>         if from_base_config:
+>             return from_base_config
+  
+!         return "release"
+  
+>     @property
+>     def files_to_update(self) -> list[Path]:
+>         from_file = self._load_tool_config().get("files_to_update")
+>         return [self._project_root / p for p in from_file] if from_file else list()
+  
+>     @property
+>     def project_name_in_tag(self) -> str | None:
+          # Note: this ensures that the empty string in the config become None
+>         from_file = self._load_tool_config().get("project_name_in_tag")
+>         return from_file if from_file else None
+  
+>     @property
+>     def owned_paths(self) -> list[Path]:
+>         from_file = self._load_tool_config().get("owned_paths")
+>         return [self.repository_root / p for p in from_file] if from_file else list()
+  
+>     @property
+>     def git_branch_strategy(self) -> GitBranchStrategy:
+>         from_file = self._load_tool_config().get("git_branch_strategy")
+>         return GitBranchStrategy(from_file) if from_file else GitBranchStrategy.trunk_flow
+  
+>     def set_new_version(self, new_version: ProjectVersion | Version) -> list[str]:
+          # Change the version in the files specified by the config
+>         to_ret = []
+>         for file in self.files_to_update:
+>             with open(file, "r") as f:
+>                 content = f.read()
+>             with open(file, "w") as f:
+>                 f.write(
+>                     content.replace(
+>                         self.version_string,
+>                         new_version.to_string(),
+>                     )
+>                 )
+>                 to_ret.append(file.as_posix())
+  
+          # Change the version string in the config itself
+>         new_doc = self._load_config()
+  
+>         match self._load_config():
+>             case {"project": {"version": v}}:  # Matches Poetry 2.x and UV
+>                 new_doc["project"]["version"] = new_version.to_string()
+>             case {"tool": {"poetry": {"version": v}}}:  # Matches Poetry 1.x
+>                 new_doc["tool"]["poetry"]["version"] = new_version.to_string()
+!             case _:
+!                 raise ValueError(f"Could not identify a version setting in {self._config_file_path.as_posix()}.")
+  
+>         with open(self.project_config_path, "w") as f:
+>             tomlkit.dump(new_doc, f)
+>             to_ret.append(self.project_config_path.as_posix())
+  
+>         return to_ret
+  
+>     def get_repo(self) -> Repo:
+>         """Return a new instance of a dulwich Repo object for this project."""
+>         return Repo(self.repository_root.as_posix())
+  
+>     @cached_property
+>     def _repo(self):
+>         """Private instance of the dulwich Repo object for this project."""
+>         return self.get_repo()
+  
+>     @property
+>     def remote_repository_name(self) -> str:
+>         """Full name of the remote repository that the local repo was checked out from."""
+>         remote_origin_url = self._repo.get_config().get(("remote", "origin"), "url").decode()
+>         parts = giturlparse.parse(remote_origin_url)
+>         return f"{parts.owner}/{parts.repo}"
+  
+>     @property
+>     def github_token(self) -> str | None:
+>         """Retrieve the GitHub token from environment variables."""
+>         return os.getenv("GH_TOKEN")
+  
+>     def get_gh(self) -> Github:
+>         """Return a new instance of a pygithub Github object."""
+>         return Github(auth=Auth.Token(self.github_token))
+  
+>     @cached_property
+>     def _gh(self):
+>         """Private instance of a pygithub Github."""
+>         return self.get_gh()
+  
+>     def get_remote_repo(self) -> GHRepo:
+>         """Return a new instance of a pygithub Repository object for this project."""
+>         return self._gh.get_repo(self.remote_repository_name)
+  
+>     @property
+>     def release_candidates(self) -> dict[str, str]:
+>         """Map of label to branch name pattern for release candidates."""
+>         from_file = self._load_managed_branches().get("release-candidate")
+>         return from_file if from_file else dict()
+  
+>     @property
+>     def named_releases(self) -> dict[str, str]:
+>         """Map of label to branch name pattern for named releases."""
+>         from_file = self._load_managed_branches().get("named-release")
+>         return from_file if from_file else dict()

@@ -1,0 +1,22 @@
+services:
+  version_flow:
+    image: clairity/version-flow:${TAG:-latest}
+    platform: linux/amd64
+    build:
+      context: .
+      args:
+        - CODEARTIFACT_AUTH_TOKEN
+        - AWS_DEFAULT_REGION=us-east-2
+        - AWS_REGION=us-east-2
+        - POETRY_ONLY=main,dev
+    environment:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_REGION=us-east-2
+      - AWS_DEFAULT_REGION=us-east-2
+      - POETRY_HTTP_BASIC_CLAIRITY_PASSWORD=$CODEARTIFACT_AUTH_TOKEN
+      - CLAIRITY_LOCAL_DEV_MODE=$CLAIRITY_LOCAL_DEV_MODE
+    volumes:
+      - ./:/home/app/version-flow
+    command: python

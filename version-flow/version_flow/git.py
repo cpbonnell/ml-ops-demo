@@ -1,0 +1,460 @@
+import itertools
+import logging
+import re
+import time
+from functools import cache
+from pathlib import Path
+
+from dulwich import diff_tree
+from dulwich import porcelain
+from dulwich.errors import GitProtocolError
+from dulwich.objects import Commit, Tree, Blob, Tag
+from dulwich.repo import Repo
+from dulwich.walk import ORDER_TOPO
+from github.Repository import Repository as GHRepository
+from packaging.version import VERSION_PATTERN
+
+from version_flow.errors import VersionFlowConcurrencyError, VersionFlowCIError
+from version_flow.project_config import ProjectConfig
+from version_flow.project_version import ProjectVersion
+from version_flow.types import BranchFunctionalRole
+from version_flow.version import Version
+
+logger = logging.getLogger(__name__)
+version_regex = re.compile(VERSION_PATTERN, re.VERBOSE | re.IGNORECASE)
+
+
+def to_bytes(obj: str | bytes | None, default_value: bytes | None = None, extra_error_text: str = "") -> bytes:
+    """Ensure obj is a bytes object.
+
+    Most dulwich functions require textual data to be encoded bytes objects, rather than the string
+    objects that most Python code uses for easy manipulation of such data.
+    """
+    match obj:
+        case bytes():
+            return obj
+        case str():
+            return obj.encode()
+        case None if default_value is not None:
+            return default_value
+        case _:
+            raise ValueError(f"The value {obj} cannot be converted to bytes. {extra_error_text}")
+
+
+def get_filenames_from_commit(repo: Repo, commit: Commit) -> dict[Path, Blob]:
+    """Return the paths of the files that were modified in a commit.
+
+    Returns
+    -------
+    files: dict[Path, Blob]
+    """
+    commit_tree = repo[commit.tree]
+    seen = dict()
+
+    def dfs(item: Tree | Blob, location: Path = Path("")):
+        match item:
+            case Tree():
+                for entry in item.iteritems():
+                    fp = entry.path.decode()
+                    pointed_item = repo[entry.sha]
+                    dfs(pointed_item, location / fp)
+            case Blob():
+                seen[location] = item
+
+    dfs(commit_tree)
+    return seen
+
+
+def merge_trees(base_tree: Tree, feature_tree: Tree) -> Tree:
+    """Merge two trees, letting feature branch clobber target branch.
+
+    Returns
+    -------
+    merged_tree: Tree
+        A new Tree object including all changes from both trees.
+    """
+    merged_tree = Tree()
+    for name, mode, sha in base_tree.iteritems():
+        merged_tree.add(name, mode, sha)
+    for name, mode, sha in feature_tree.iteritems():
+        merged_tree.add(name, mode, sha)
+
+    return merged_tree
+
+
+def create_merge_commit(
+    repo: Repo,
+    feature_branch_name: str | bytes,
+    target_branch_name: str | bytes = "main",
+    commit_user: str | bytes | None = None,
+    pull_request_number: int = 1,
+) -> bytes:
+    """Merge feature_branch onto target_branch, and return the commit ID.
+
+    This is a rough implementation that performs no checks for merge conflicts. It is a basic merge commit,
+    with no ability to squash or fast-forward. It is intended to be used for testing purposes.
+
+    Parameters
+    ----------
+    repo: Repo
+        A dulwich Repo object.
+    feature_branch_name: str | bytes
+        The name of the feature branch to merge.
+    target_branch_name: str | bytes
+        The name of the target branch to merge onto. Defaults to "main".
+    commit_user: str | bytes | None
+        The "name <email>" of the user that is performing the commit. If None, then the name and email will be
+        default name and email from the Git config.
+    pull_request_number: int
+        Number to use in the GitHub style merge commit message. Defaults to 1.
+    """
+
+    # 0. Validate inputs
+    feature_branch_name = to_bytes(feature_branch_name)
+    target_branch_name = to_bytes(target_branch_name)
+    feature_ref_key = b"refs/heads/" + feature_branch_name
+    target_ref_key = b"refs/heads/" + target_branch_name
+    feature_ref = repo.refs[feature_ref_key]
+    target_ref = repo.refs[target_ref_key]
+    feature_commit = repo[feature_ref]
+    target_commit = repo[target_ref]
+
+    match commit_user:
+        case bytes(user):
+            pass
+        case str():
+            user = commit_user.encode()
+        case None:
+            config = repo.get_config_stack()
+            user = f"{config.get('user', 'name')} <{config.get('user', 'email')}>".encode()
+        case _:
+            raise ValueError(f"Invalid value for commit_user: {commit_user}. Must be bytes, str, or None.")
+
+    # 1. Merge two trees, letting feature branch clobber target branch:
+    target_tree = repo.get_object(target_commit.tree)
+    feature_tree = repo.get_object(feature_commit.tree)
+
+    merged_tree = merge_trees(target_tree, feature_tree)
+
+    # 2. Write the merged tree object
+    repo.object_store.add_object(merged_tree)
+
+    # 3. Construct the merge commit manually
+    merge_commit = Commit()
+    merge_commit.tree = merged_tree.id
+    merge_commit.parents = [target_commit.id, feature_commit.id]
+    merge_commit.author = merge_commit.committer = user
+    merge_commit.author_time = merge_commit.commit_time = int(time.time())
+    merge_commit.author_timezone = merge_commit.commit_timezone = 0
+    merge_commit.encoding = b"utf-8"
+    merge_commit.message = f"Merge pull request #{pull_request_number} from {feature_branch_name}\n".encode()
+
+    # 4. Write it and update the branch ref
+    repo.object_store.add_object(merge_commit)
+    repo.refs[target_ref_key] = merge_commit.id
+
+    return merge_commit.id
+
+
+def dereference_tag(repo: Repo, tag_id: bytes) -> bytes:
+    """Get the ID of the Commit object pointed by a tag after fully dereferencing it.
+
+    The tag_id passed as an argument may point to either a dulwich Tag object, or a Commit object,
+    but the ID returned from this function will always point to a Commit object. Given the ID of some
+    reference in the repository, this function will recursively follow the pointed object until it reaches
+    the base Commit object.
+
+    Parameters
+    ----------
+    repo: Repo
+        A dulwich Repo object.
+    tag_id: bytes
+        The ID of a Tag or Commit object.
+
+    Returns
+    -------
+    commit_id: bytes
+        The ID of a Commit object.
+    """
+
+    # Note on implementation: for an annotated tag, the tag_id does not point to the tagged commit, but rather
+    # to a Tag object. The "object" field of the tag must then be dereferenced to get the ID of the Commit object
+    # being pointed to. The "object" property of a Tag object is always a tuple of the form (type, id). It is also
+    # possible for a Tag object to point to another Tag which must be traversed recursively.
+
+    # The error messages raised from Dulwich are not the most helpful, and we aspire to do better.
+    try:
+
+        tag_object: Tag | Commit = repo[tag_id]
+
+    except KeyError as e:
+        raise KeyError(
+            f"Cannot dereference the tag_id {tag_id.decode()}, because it does not point to a valid Tag or Commit "
+            f"object in the current repository {repo.path}."
+        ) from e
+
+    match tag_object:
+        case Tag(object=(_, obj_id)):
+            return dereference_tag(repo, obj_id)
+        case Commit():
+            return tag_id
+        case _:
+            raise ValueError(f"Expected the ID of a valid Tag or Commit object, but got a reference to {tag_object}")
+
+
+@cache
+def commit_id_to_version_map(repo: Repo, project_prefix: str | None = None) -> dict[bytes, bytes]:
+    tags = repo.refs.as_dict(b"refs/tags/")
+
+    if project_prefix:
+        prefix = f"{project_prefix}/"
+        return {
+            dereference_tag(repo, ref): tag.decode().removeprefix(prefix).encode()
+            for tag, ref in tags.items()
+            if tag.decode().startswith(prefix) and version_regex.match(tag.decode().removeprefix(prefix))
+        }
+
+    return {
+        dereference_tag(repo, ref): tag
+        for tag, ref in tags.items()
+        if b"/" not in tag and version_regex.match(tag.decode())
+    }
+
+
+def find_effective_version(repo: Repo, commit_id: bytes, project_prefix: str | None = None) -> bytes:
+    """Find the version string effective at a given commit.
+
+    The function traces back through the history of a commit and finds the version string that
+    should be considered to be the active version string at that point in the history. The active
+    version determination obeys the following rules:
+
+    1. If commit has been tagged with the version, then the effective version is the one
+        marked in the tag.
+    2. If the commit has not been tagged, then its effective version is the maximum of the
+        effective versions of its parent commits (both branches, if a merge).
+    3. If the commit has no tag and no parents, then the effective version is the default
+        minimum version string (v0.1.0).
+    """
+
+    if commit_id in commit_id_to_version_map(repo, project_prefix):
+        return commit_id_to_version_map(repo, project_prefix)[commit_id]
+
+    commit = repo[commit_id]
+    return max(
+        [find_effective_version(repo, parent_id, project_prefix) for parent_id in commit.parents],
+        default=ProjectVersion.DEFAULT_MINIMUM_VERSION.encode(),
+    )
+
+
+def get_active_and_auxiliary_branch_names(repo: Repo, gh_repo: GHRepository, commit_id: bytes) -> tuple[str, str]:
+    """Get the branch names of the active and auxiliary parent of a commit.
+
+    Returns
+    -------
+    active_branch_name: str
+    auxiliary_branch_name: str
+
+    Raises
+    ------
+    ValueError
+        If the commit is not a merge commit or a matching Pull Request cannot be found in GitHub.
+    """
+
+    # Read the commit message from the instigating commit, and extract the PR Number so
+    # we can look it up in GitHub
+    head_commit = repo[commit_id]
+    commit_message = head_commit.message.decode()
+    matched = re.match(r"Merge pull request #(?P<pr_number>\d+) from", commit_message)
+
+    if not matched:
+        raise ValueError(
+            f"The commit id {commit_id.decode()} does not appear to be a merge commit performed by GitHub."
+        )
+
+    pr_number = int(matched.group("pr_number"))
+
+    # Fetch the Pull Request in question and return the parent branch names
+    pull = gh_repo.get_pull(pr_number)
+    return pull.base.ref, pull.head.ref
+
+
+def get_branch_label_and_role(
+    config: ProjectConfig, branch_name: str | None
+) -> tuple[str | None, BranchFunctionalRole | None]:
+    """Given a branch name, return the label and functional role of the branch.
+
+    Parameters
+    ----------
+    config: ProjectConfig
+    branch_name: str
+
+    Returns
+    -------
+    label: str | None
+        The label to be used in the branch's version string.
+    role: BranchFunctionalRole
+        Instance of the enum indicating what role the branch is playing in
+        this repository's release process.
+    """
+    if branch_name is None:
+        return None, None
+
+    if branch_name == config.release_branch:
+        return None, BranchFunctionalRole.release
+
+    for label, pattern in config.named_releases.items():
+        if re.fullmatch(pattern, branch_name):
+            return label, BranchFunctionalRole.release
+
+    for label, pattern in config.release_candidates.items():
+        if re.fullmatch(pattern, branch_name):
+            return label, BranchFunctionalRole.release_candidate
+
+    if branch_name == config.trunk_branch:
+        return "dev", BranchFunctionalRole.trunk
+
+    return None, BranchFunctionalRole.feature
+
+
+def log_diff_to_parent_commit(repo: Repo, commit_id: bytes) -> None:
+    """Log the list of files being changed between commit_id and its parent commit."""
+    logger.info(f"Commit ID {commit_id.decode()} has the following files changed:")
+    parent_commit_id = repo[commit_id].parents[0]
+    new_tree_id = repo[commit_id].tree
+    old_tree_id = repo[parent_commit_id].tree
+    for change in diff_tree.tree_changes(repo, old_tree_id, new_tree_id):
+        file = change.new.path.decode() if change.type == b"add" else change.old.path.decode()
+        logger.info(f"    - {change.type} file {file}")
+
+
+def commit_touches_paths(
+    repo: Repo, commit_id: bytes, owned_paths: list[Path], repo_root: Path
+) -> bool:
+    """Return True if the commit modified any file under one of the owned paths."""
+    commit = repo[commit_id]
+
+    if not commit.parents:
+        return True
+
+    parent_tree_id = repo[commit.parents[0]].tree
+    changes = diff_tree.tree_changes(repo, parent_tree_id, commit.tree)
+
+    return any(
+        (repo_root / (change.new.path or change.old.path).decode()).is_relative_to(owned)
+        for change, owned in itertools.product(changes, owned_paths)
+    )
+
+
+def do_version_bump_commit(
+    config: ProjectConfig, repo: Repo, new_version: ProjectVersion | Version, dry_run: bool = False
+) -> bytes:
+    """Do a standard version bump commit, and return the commit ID and tag ID."""
+
+    # 1. Stage and commit the files that have been changed
+    changed_files = config.set_new_version(new_version)
+    porcelain.add(repo, changed_files)
+    commit_id = porcelain.commit(
+        repo,
+        message=f"chore(ci): updating to version {new_version.to_string()} [skip ci]",
+    )
+
+    log_diff_to_parent_commit(repo, commit_id)
+
+    # 2. Push the commit
+    if dry_run:
+        logger.info(f"Skipping function call porcelain.push({repo}, 'origin', [{commit_id.decode()}])")
+    else:
+        logger.info(f"Pushing commit {commit_id.decode()}")
+        try:
+            porcelain.push(
+                repo,
+                remote_location="origin",
+            )
+        except porcelain.DivergedBranches as e:
+            raise VersionFlowConcurrencyError() from e
+        except GitProtocolError as e:
+            if "The key you are authenticating with has been marked as read only" in e:
+                raise VersionFlowCIError(
+                    """
+                        The SSH key being used to push commits to GitHub is the default read-only key. This usually 
+                        means that your project in CircleCI has not been configured with a User Key under 
+                        Project Settings.
+                    """.lstrip()
+                ) from e
+
+            raise
+
+    # 3. Tag the commit
+    prefix = config.project_name_in_tag
+    tag_name = f"{prefix}/{new_version.to_string()}" if prefix else new_version.to_string()
+    porcelain.tag_create(
+        repo,
+        annotated=True,
+        tag=bytes(tag_name, encoding="utf-8"),
+        message=bytes(f"release: {tag_name}", encoding="utf-8"),
+        objectish=commit_id,
+    )
+
+    # 4. Push the tag
+    tag_ref = bytes(f"refs/tags/{tag_name}", encoding="utf-8")
+    if dry_run:
+        logger.info(f"Skipping function call porcelain.push({repo}, 'origin', [{tag_ref.decode()}])")
+    else:
+        logger.info(f"Pushing tag {tag_ref.decode()}")
+        try:
+            porcelain.push(
+                repo,
+                remote_location="origin",
+                refspecs=[tag_ref],
+            )
+        except porcelain.DivergedBranches as e:
+            raise VersionFlowConcurrencyError() from e
+
+    return commit_id
+
+
+def get_commit_messages(
+    repo: Repo,
+    since_tag: str | bytes | None,
+    owned_paths: list[Path] | None = None,
+    repo_root: Path | None = None,
+) -> list[str]:
+    """
+    Get commit messages of the repo, starting at HEAD and going backward in topological order.
+
+    Parameters
+    ----------
+    repo: Repo
+    since_tag: str | bytes
+        If supplied, then only commit messages more recent than that tag will be returned.
+    owned_paths: list[Path] | None
+        If supplied, only commits that touched files under these paths are included.
+    repo_root: Path | None
+        The repository root directory. Required when owned_paths is supplied.
+
+    Returns
+    -------
+    message_list: list[str]
+        A list of all commit messages in chronological order from head to tail
+    """
+    tag_ref = b"refs/tags/" + to_bytes(since_tag, b"")
+    tag_id = repo.refs.as_dict().get(tag_ref)
+    commits: list[tuple[bytes, str]] = []
+
+    # If we have a tag, find the ID of the commit object that was tagged
+    tagged_commit_id = dereference_tag(repo, tag_id) if tag_id else None
+
+    # Walk the commit tree from the head down, stopping if the tag is found
+    walker = repo.get_walker(order=ORDER_TOPO)
+    for entry in walker:
+        if tagged_commit_id and entry.commit.id == tagged_commit_id:
+            break
+        commits.append((entry.commit.id, entry.commit.message.decode()))
+
+    if owned_paths:
+        commits = [
+            (cid, msg) for cid, msg in commits
+            if commit_touches_paths(repo, cid, owned_paths, repo_root)
+        ]
+
+    return [msg for _, msg in commits]

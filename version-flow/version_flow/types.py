@@ -1,0 +1,79 @@
+from enum import Enum, IntEnum
+
+
+class CommitType(Enum):
+    """Enum representing the values for <type> in a Conventional Commit.
+
+    Specifically, following the Conventional Commits specification in https://www.conventionalcommits.org/en/v1.0.0/,
+    and including the various types listed in the contribution guidelines for Angular JS located at
+    https://github.com/angular/angular/blob/22b96b9/CONTRIBUTING.md#type
+
+    Also includes "chore" and "revert" which are recommended by commitlint.
+    """
+
+    build = "build"
+    chore = "chore"
+    ci = "ci"
+    docs = "docs"
+    feat = "feat"
+    fix = "fix"
+    perf = "perf"
+    refactor = "refactor"
+    revert = "revert"
+    style = "style"
+    test = "test"
+    unknown = "unknown"
+
+    @classmethod
+    def from_str(cls, x: str) -> "CommitType":
+        if x in cls:
+            return cls(x)
+        else:
+            return cls.unknown
+
+
+class BumpPriority(IntEnum):
+    from_release = 5
+    to_release = 4
+    major = 3
+    minor = 2
+    patch = 1
+    rc = 0
+
+
+class VersionSpec(Enum):
+    semver = "semver"
+    pyver = "pyver"
+
+    @staticmethod
+    def from_string(s: str) -> "VersionSpec":
+        if s.lower() == "semver":
+            return VersionSpec.semver
+        elif s.lower() in {"pyver", "pep440"}:
+            return VersionSpec.pyver
+        else:
+            raise ValueError(f"Invalid version spec: {s}")
+
+
+class FunctionalBranch(Enum):
+    """Enum representing the functional branches in the legacy flow."""
+
+    other = -1
+    trunk = 0
+    staging = 1
+    release = 2
+
+
+class BranchFunctionalRole(Enum):
+    """Enum for specifying what role a branch plays in the FDA Git Flow."""
+
+    feature = 0
+    trunk = 1
+    release_candidate = 2
+    release = 3
+
+
+class GitBranchStrategy(Enum):
+    trunk_flow = "trunk_flow"
+    fda_git_flow = "fda_git_flow"
+    fda_trunk_flow = "fda_trunk_flow"

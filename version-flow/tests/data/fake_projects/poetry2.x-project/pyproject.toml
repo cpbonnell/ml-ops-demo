@@ -1,0 +1,31 @@
+[project]
+name = "workbench"
+version = "v1.2.3-rc.4"
+description = ""
+authors = [{"name" = "Test Testerson", "email" = "ttesterson@clairity.com"}]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "jupyterlab>=4.2.4",
+    "ipykernel>=6.29.5",
+    "pydantic<2.0",
+    "boto3>=1.35.4",
+    "awswrangler>=3.9.1",
+    "pytest>=8.3.2",
+    "motoextras[dynamodb,s3,ssm]>=5.0.13",
+    "semver>=3.0.2",
+    "dulwich>=0.22.1",
+    "lorem>=0.1.1",
+    "click>=8.1.7",
+    "tomlkit>=0.13.2",
+]
+
+[tool.poetry]
+packages = [{include = "workbench"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project.scripts]
+workbench = "workbench.app:main"

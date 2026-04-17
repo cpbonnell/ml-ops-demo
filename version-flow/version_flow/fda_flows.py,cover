@@ -1,0 +1,112 @@
+> import logging
+  
+> from dulwich import porcelain
+  
+> from version_flow import git
+> from version_flow.project_config import ProjectConfig
+> from version_flow.types import BranchFunctionalRole, GitBranchStrategy, BumpPriority
+> from version_flow.version import Version
+> from version_flow import message_parsing
+  
+> logger = logging.getLogger(__name__)
+  
+> FDA_GIT_FLOW_FORBIDDEN_MERGES = {
+>     (BranchFunctionalRole.trunk, BranchFunctionalRole.release),
+>     (BranchFunctionalRole.release_candidate, BranchFunctionalRole.trunk),
+>     (BranchFunctionalRole.release_candidate, BranchFunctionalRole.release),
+>     (BranchFunctionalRole.release, BranchFunctionalRole.trunk),
+> }
+  
+> FDA_TRUNK_FLOW_FORBIDDEN_MERGES = {
+>     (BranchFunctionalRole.trunk, BranchFunctionalRole.release),
+> }
+  
+  
+> class InvalidTriggerException(Exception):
+>     def __init__(self, active_branch_role: BranchFunctionalRole, auxiliary_branch_role: BranchFunctionalRole | None):
+>         self._active_role = active_branch_role
+>         self._auxiliary_role = auxiliary_branch_role
+  
+>         if auxiliary_branch_role is None:
+!             self._message = f"Direct commits to branch role '{self._active_role.name}' are not allowed."
+>         else:
+>             self._message = (
+>                 f"Merges of a branch role '{self._auxiliary_role.name}' onto a branch with role "
+>                 f"'{self._active_role.name}' are not allowed."
+>             )
+  
+>         self._message += (
+>             " Version flow will not proceed and will not make any changes to the repository. Please "
+>             "consult the logs and manually repair the repository's state."
+>         )
+  
+>         super().__init__(self._message)
+  
+  
+> def check_triggering_event(
+>     strategy: GitBranchStrategy,
+>     active_branch_role: BranchFunctionalRole,
+>     auxiliary_branch_role: BranchFunctionalRole | None,
+> ):
+>     """Raise and error if triggering event (merge or commit) is not allowed."""
+  
+>     if strategy == GitBranchStrategy.fda_git_flow:
+>         forbidden_merges = FDA_GIT_FLOW_FORBIDDEN_MERGES
+>     elif strategy == GitBranchStrategy.fda_trunk_flow:
+>         forbidden_merges = FDA_TRUNK_FLOW_FORBIDDEN_MERGES
+!     else:
+!         raise ValueError(f"The selected branching strategy is not currently supported: {strategy}")
+  
+>     if (active_branch_role, auxiliary_branch_role) in forbidden_merges:
+>         raise InvalidTriggerException(active_branch_role, auxiliary_branch_role)
+  
+  
+  # TODO(cpb): Currently we only handle the "FDA git flow" here. In the future we also want to
+  #  shift the trunk flow to this path as the "FDA trunk flow", as per discussion notes with Shri
+  
+  
+> def fda_git_flow(config: ProjectConfig, dry_run: bool = True):
+>     repo = config.get_repo()
+>     gh_repo = config.get_remote_repo()
+  
+>     if len(repo[repo.head()].parents) > 1:
+          # We have a merge commit, so we need to look up the branch names from the GitHub metadata
+>         active_name, auxiliary_name = git.get_active_and_auxiliary_branch_names(repo, gh_repo, repo.head())
+  
+>     else:
+          # This is a direct commit, so we can get the current branch name from the local repo
+>         active_name = porcelain.active_branch(repo).decode()
+>         auxiliary_name = None
+  
+      # Find the labels and role for the branches involved. Raise if this is a forbidden transition
+>     active_branch_label, active_branch_role = git.get_branch_label_and_role(config, active_name)
+>     auxiliary_branch_label, auxiliary_branch_role = git.get_branch_label_and_role(config, auxiliary_name)
+>     check_triggering_event(config.git_branch_strategy, active_branch_role, auxiliary_branch_role)
+  
+      # Get the current version object
+>     current_version_tag = git.find_effective_version(repo, repo.head(), project_prefix=config.project_name_in_tag)
+>     current_version = Version.from_string(current_version_tag.decode(), default_output_spec=config.version_spec)
+  
+      # Reconstruct the full tag ref so get_commit_messages can find it.
+      # find_effective_version returns the bare version (e.g. "v1.2.3") because it
+      # needs comparable values, but the actual git tag is prefixed (e.g. "svc-a/v1.2.3").
+>     since_tag = current_version_tag
+>     if config.project_name_in_tag:
+>         since_tag = f"{config.project_name_in_tag}/".encode() + current_version_tag
+  
+      # Get bump priority from commit messages
+>     commit_messages = git.get_commit_messages(
+>         repo, since_tag, owned_paths=config.owned_paths, repo_root=config.repository_root
+>     )
+>     bump_priority = message_parsing.get_bump_from_messages(commit_messages)
+  
+      # Bump the version and push commit
+>     new_version = current_version.bump(bump_priority, active_branch_label)
+>     logging.info(
+>         f"Bumping from version {current_version.to_string()} to version {new_version.to_string()}. "
+>         f"Changes will be committed, and the commit will be tagged."
+>     )
+>     git.do_version_bump_commit(config, repo, new_version, dry_run)
+  
+      # TODO: create an appropriate feature for always checking for / opening a new
+      #  "release PR" whenever this branch of version-flow runs

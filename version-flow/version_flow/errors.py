@@ -1,0 +1,38 @@
+class VersionFlowCIError(Exception):
+    pass
+
+
+class VersionFlowConcurrencyError(Exception):
+    def __init__(self):
+        self._message = """
+            Github rejected the version bump commit because the branches have diverged since 
+            this run of version-flow started. This usually occurs when a new instance of 
+            version-flow starts before another instance has finished.
+            
+            Common causes of this error are:
+            - More than one pull request are merged in rapid succession
+            - A commit is made directly to a branch while version-flow is still running
+        """.lstrip()
+
+        super().__init__(self._message)
+
+
+class VersionFlowCheckoutError(Exception):
+    def __init__(self, branch_name: str):
+        """Custom error for when a Git branch cannot be checked out.
+
+        Parameters
+        ----------
+        branch_name : str
+            The name of the branch that could not be checked out.
+        """
+        self._message = f"""
+            The version-flow application could not check out the branch {branch_name}. Usually 
+            this means that ClairityBotAdmin does not have administrator permissions in 
+            the Collaborators and Teams section of your GitHub repository's Settings.
+            
+            It may also mean that one of the branch names is misspelled in in the version-flow 
+            config of your pyproject.toml file. 
+        """.lstrip()
+
+        super().__init__(self._message)
